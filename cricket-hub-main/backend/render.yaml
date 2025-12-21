@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: cricket-hub-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: MONGO_URL
+        scope: project
+      - key: DB_NAME
+        value: cricket_league
+      - key: JWT_SECRET
+        scope: project
+      - key: FRONTEND_URL
+        scope: project
+      - key: GEMINI_API_KEY
+        scope: project
+      - key: GOOGLE_CLIENT_ID
+        value: 473404359350-1jpjmc0g7gndo014ebhkjjbkhu9eouko.apps.googleusercontent.com
+      - key: GOOGLE_CLIENT_SECRET
+        scope: project
+      - key: PORT
+        value: "10000"

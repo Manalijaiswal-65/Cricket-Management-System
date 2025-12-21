@@ -1,0 +1,196 @@
+{
+  "identity": {
+    "name": "E1",
+    "role": "Creative Designer",
+    "mission": "Create a top 1% Sports League Management System with a 'Night Match' aesthetic.",
+    "principles": [
+      "Fusion over Imitation: Mix Sports Broadcast visuals with SaaS precision.",
+      "Emotion First: Every screen feels like 'Game Night'.",
+      "Content is King: Data (scores, stats) is the hero.",
+      "Zoom In: Focus on player stats and live moments.",
+      "Negative Space: Use dark voids to make neon stats pop."
+    ]
+  },
+  "theme": {
+    "name": "Night Match",
+    "mode": "dark",
+    "emotional_archetype": "Electric & Neon",
+    "vibe": "Competitive, Immersive, High-Contrast",
+    "description": "A dark, immersive interface inspired by night cricket matches under floodlights. Deep blacks, neon greens, and electric blues."
+  },
+  "typography": {
+    "fonts": {
+      "headings": {
+        "family": "Chivo, sans-serif",
+        "usage": "Page titles, Section headers, Hero text",
+        "weights": ["900", "700"],
+        "className": "font-chivo tracking-tight"
+      },
+      "body": {
+        "family": "Manrope, sans-serif",
+        "usage": "General text, descriptions, form labels",
+        "weights": ["400", "500"],
+        "className": "font-manrope"
+      },
+      "mono": {
+        "family": "JetBrains Mono, monospace",
+        "usage": "Stats, Scores, Leaderboards, Timers",
+        "weights": ["500"],
+        "className": "font-mono"
+      }
+    },
+    "installation": "Import these fonts via Google Fonts in index.css: @import url('https://fonts.googleapis.com/css2?family=Chivo:wght@700;900&family=JetBrains+Mono:wght@500&family=Manrope:wght@400;500;700&display=swap');"
+  },
+  "colors": {
+    "palette": {
+      "background": {
+        "default": "#09090b",
+        "surface": "#18181b",
+        "overlay": "rgba(9, 9, 11, 0.8)"
+      },
+      "primary": {
+        "default": "#4ade80",
+        "foreground": "#022c22",
+        "description": "Neon Green (Cricket Field)"
+      },
+      "secondary": {
+        "default": "#3b82f6",
+        "foreground": "#ffffff",
+        "description": "Electric Blue (Night Sky/Tech)"
+      },
+      "accent": {
+        "default": "#f472b6",
+        "foreground": "#ffffff",
+        "description": "Hot Pink (Live/Urgent)"
+      },
+      "muted": {
+        "default": "#27272a",
+        "foreground": "#a1a1aa"
+      },
+      "border": "#27272a"
+    },
+    "tailwind_config_extension": {
+      "colors": {
+        "background": "hsl(240 10% 3.9%)",
+        "foreground": "hsl(0 0% 98%)",
+        "card": "hsl(240 10% 3.9%)",
+        "card-foreground": "hsl(0 0% 98%)",
+        "popover": "hsl(240 10% 3.9%)",
+        "popover-foreground": "hsl(0 0% 98%)",
+        "primary": "hsl(142 76% 36%)",
+        "primary-foreground": "hsl(355.7 100% 97.3%)",
+        "secondary": "hsl(217.2 91.2% 59.8%)",
+        "secondary-foreground": "hsl(222.2 47.4% 11.2%)",
+        "muted": "hsl(240 3.7% 15.9%)",
+        "muted-foreground": "hsl(240 5% 64.9%)",
+        "accent": "hsl(240 3.7% 15.9%)",
+        "accent-foreground": "hsl(0 0% 98%)",
+        "destructive": "hsl(0 62.8% 30.6%)",
+        "destructive-foreground": "hsl(0 0% 98%)",
+        "border": "hsl(240 3.7% 15.9%)",
+        "input": "hsl(240 3.7% 15.9%)",
+        "ring": "hsl(142 76% 36%)"
+      }
+    }
+  },
+  "layout_strategies": {
+    "marketing": {
+      "grid": "Mode A: The Tetris Grid",
+      "spacing": "Generous (p-12 to p-24)",
+      "container": "max-w-7xl mx-auto",
+      "vibe": "Asymmetric, Artistic, High Impact"
+    },
+    "dashboard": {
+      "grid": "Mode B: The Control Room Grid",
+      "spacing": "Tight (gap-4, p-6)",
+      "container": "w-full px-6",
+      "vibe": "Dense, Data-Rich, Scannable"
+    }
+  },
+  "components": {
+    "buttons": {
+      "style": "Sharp edges or minimal radius (rounded-md). High contrast hover states.",
+      "primary": "bg-primary text-primary-foreground hover:bg-primary/90 shadow-[0_0_15px_rgba(74,222,128,0.5)]",
+      "secondary": "bg-secondary text-secondary-foreground hover:bg-secondary/80"
+    },
+    "cards": {
+      "style": "Glassmorphism or Solid Dark Surface with Neon Border Glow on hover.",
+      "base": "bg-card border border-border/50 hover:border-primary/50 transition-colors duration-300",
+      "glass": "bg-black/40 backdrop-blur-xl border-white/10"
+    },
+    "inputs": {
+      "style": "Flat, dark background, bottom border focus or full ring.",
+      "classes": "bg-muted/50 border-transparent focus:border-primary focus:ring-1 focus:ring-primary"
+    }
+  },
+  "visual_enhancers": {
+    "textures": "Use subtle noise overlays on solid backgrounds to prevent 'digital flatness'.",
+    "gradients": "Use 'Tracing Beam' borders for feature cards. No full-screen gradients.",
+    "shadows": "Colored shadows for primary actions (e.g., Green glow for 'Start Match').",
+    "motion": {
+      "library": "framer-motion",
+      "types": [
+        "Hover: Scale 1.02 + Glow",
+        "Entrance: Staggered Fade Up",
+        "Transition: Smooth Opacity"
+      ]
+    }
+  },
+  "images": {
+    "hero": {
+      "url": "https://images.unsplash.com/photo-1709134800864-15d9d04bc1f2?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzl8MHwxfHNlYXJjaHwyfHxjcmlja2V0JTIwcGxheWVyJTIwYWN0aW9uJTIwc3RhZGl1bXxlbnwwfHx8fDE3NjU1NDIwNTJ8MA&ixlib=rb-4.1.0&q=85",
+      "alt": "Cricket batter swinging in action",
+      "usage": "Landing Page Hero Background"
+    },
+    "backgrounds": [
+      {
+        "url": "https://images.unsplash.com/photo-1750716413756-b66624b64ce4?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzh8MHwxfHNlYXJjaHwzfHxjcmlja2V0JTIwc3RhZGl1bSUyMG5pZ2h0JTIwbGlnaHRzfGVufDB8fHx8MTc2NTU0MjA1NHww&ixlib=rb-4.1.0&q=85",
+        "alt": "Stadium Night Lights",
+        "usage": "Section Backgrounds, Auth Page Background"
+      }
+    ],
+    "placeholders": {
+      "team_logo": "https://images.unsplash.com/photo-1728406970302-8be1af6bda4c?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzV8MHwxfHNlYXJjaHwyfHxtb2Rlcm4lMjBhYnN0cmFjdCUyMHNwb3J0cyUyMHRlYW0lMjBsb2dvfGVufDB8fHx8MTc2NTU0MjA1NXww&ixlib=rb-4.1.0&q=85",
+      "player_avatar": "https://images.unsplash.com/photo-1723309105929-23fb8e86ab1d?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzl8MHwxfHNlYXJjaHwxfHxjcmlja2V0JTIwcGxheWVyJTIwYWN0aW9uJTIwc3RhZGl1bXxlbnwwfHx8fDE3NjU1NDIwNTJ8MA&ixlib=rb-4.1.0&q=85"
+    }
+  },
+  "instructions_to_main_agent": {
+    "general": [
+      "Implement the 'Night Match' theme immediately by updating tailwind.config.js and index.css.",
+      "Use the provided image URLs for all placeholder images.",
+      "Ensure all text meets APCA contrast standards against the dark background.",
+      "Use 'Chivo' for all headings and 'JetBrains Mono' for all stats/numbers.",
+      "Do not use 'Inter' for headings.",
+      "Use shadcn/ui components for all interactive elements but customize their styling to match the 'Night Match' theme (remove rounded corners, add glows).",
+      "For the Dashboard, use the 'Control Room' grid layout (dense, data-heavy).",
+      "For the Landing Page, use the 'Tetris' grid layout (asymmetric, artistic)."
+    ],
+    "files": {
+      "tailwind_config": "/app/frontend/tailwind.config.js",
+      "global_css": "/app/frontend/src/index.css",
+      "components_dir": "/app/frontend/src/components/ui"
+    },
+    "tech_stack": {
+      "framework": "React (Vite)",
+      "styling": "Tailwind CSS",
+      "components": "shadcn/ui (.jsx)",
+      "icons": "lucide-react"
+    }
+  },
+  "universal_guidelines": [
+    "Dark colors look good when used independently without gradients. DO NOT use dark colors as gradients.",
+    "Don't make generic centered layouts, simplistic gradients, and uniform styling.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "Use glass-morphism effects with backdrop filters (12-24px blur).",
+    "You MUST NOT apply universal transition. Eg: transition: all.",
+    "You MUST NOT center align the app container.",
+    "Always use modern button styles like pill-shaped, or sharp button with interaction animations.",
+    "NEVER use AI assistant Emoji characters.",
+    "Every interaction needs micro-animations.",
+    "Use 2-3x more spacing than feels comfortable.",
+    "Subtle grain textures, noise overlays, custom cursors, selection states, and loading animations.",
+    "Components MUST use named exports.",
+    "Pages MUST use default exports.",
+    "Use sonner for toasts."
+  ]
+}

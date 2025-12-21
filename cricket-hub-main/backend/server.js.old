@@ -1,0 +1,1287 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
+const bcrypt = require('bcryptjs');
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+const { User, Session, Team, Player, Tournament, TournamentMatch, ChatMessage, Prediction } = require('./models');
+const { authenticate, requireAdmin, requireManagerOrAdmin, generateToken } = require('./middleware');
+
+const app = express();
+const server = http.createServer(app);
+
+// CORS Configuration - Allow specific origins for credentials
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  process.env.FRONTEND_URL || 'http://localhost:3000'
+].filter(Boolean);
+
+// Socket.IO setup
+const io = new Server(server, {
+  cors: {
+    origin: allowedOrigins,
+    methods: ['GET', 'POST'],
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization']
+  }
+});
+
+// Middleware
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('CORS not allowed'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json());
+
+// Cookie parser middleware
+app.use((req, res, next) => {
+  const cookieHeader = req.headers.cookie;
+  req.cookies = {};
+  if (cookieHeader) {
+    cookieHeader.split(';').forEach(cookie => {
+      const [name, value] = cookie.trim().split('=');
+      req.cookies[name] = value;
+    });
+  }
+  next();
+});
+
+// MongoDB Connection
+const MONGO_URL = process.env.MONGO_URL;
+const DB_NAME = process.env.DB_NAME || 'cricket_league';
+
+mongoose.connect(`${MONGO_URL}/${DB_NAME}`)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Gemini AI Setup
+let genAI = null;
+if (process.env.GEMINI_API_KEY) {
+  genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+}
+
+// ==================== SOCKET.IO HANDLERS ====================
+const activeUsers = new Map();
+const liveScoreViewers = new Map();
+
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.id);
+
+  // Join match room for live chat
+  socket.on('join_match', async ({ match_id, user }) => {
+    socket.join(`match_${match_id}`);
+    socket.matchId = match_id;
+    socket.user = user;
+
+    if (!activeUsers.has(match_id)) {
+      activeUsers.set(match_id, new Set());
+    }
+    activeUsers.get(match_id).add(user?.name || 'Anonymous');
+
+    const recentMessages = await ChatMessage.find({ match_id })
+      .sort({ created_at: -1 })
+      .limit(50)
+      .select('-_id -__v');
+
+    socket.emit('recent_messages', recentMessages.reverse());
+    io.to(`match_${match_id}`).emit('viewer_count', activeUsers.get(match_id).size);
+  });
+
+  // Join tournament room for live updates
+  socket.on('join_tournament', ({ tournament_id, user }) => {
+    socket.join(`tournament_${tournament_id}`);
+    socket.tournamentId = tournament_id;
+
+    if (!liveScoreViewers.has(tournament_id)) {
+      liveScoreViewers.set(tournament_id, new Set());
+    }
+    liveScoreViewers.get(tournament_id).add(socket.id);
+
+    io.to(`tournament_${tournament_id}`).emit('tournament_viewer_count', liveScoreViewers.get(tournament_id).size);
+  });
+
+  // Send chat message
+  socket.on('send_message', async ({ match_id, message, user }) => {
+    try {
+      const chatMessage = new ChatMessage({
+        message_id: `msg_${uuidv4().slice(0, 12)}`,
+        match_id,
+        user_id: user?.user_id || 'anonymous',
+        user_name: user?.name || 'Anonymous',
+        user_picture: user?.picture,
+        message,
+        created_at: new Date()
+      });
+
+      await chatMessage.save();
+
+      io.to(`match_${match_id}`).emit('new_message', {
+        message_id: chatMessage.message_id,
+        match_id,
+        user_id: chatMessage.user_id,
+        user_name: chatMessage.user_name,
+        user_picture: chatMessage.user_picture,
+        message: chatMessage.message,
+        created_at: chatMessage.created_at
+      });
+    } catch (error) {
+      console.error('Error sending message:', error);
+    }
+  });
+
+  // Leave rooms
+  socket.on('leave_match', ({ match_id }) => {
+    socket.leave(`match_${match_id}`);
+    if (activeUsers.has(match_id) && socket.user) {
+      activeUsers.get(match_id).delete(socket.user.name);
+      io.to(`match_${match_id}`).emit('viewer_count', activeUsers.get(match_id).size);
+    }
+  });
+
+  socket.on('leave_tournament', ({ tournament_id }) => {
+    socket.leave(`tournament_${tournament_id}`);
+    if (liveScoreViewers.has(tournament_id)) {
+      liveScoreViewers.get(tournament_id).delete(socket.id);
+      io.to(`tournament_${tournament_id}`).emit('tournament_viewer_count', liveScoreViewers.get(tournament_id).size);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    if (socket.matchId && activeUsers.has(socket.matchId) && socket.user) {
+      activeUsers.get(socket.matchId).delete(socket.user.name);
+      io.to(`match_${socket.matchId}`).emit('viewer_count', activeUsers.get(socket.matchId).size);
+    }
+    if (socket.tournamentId && liveScoreViewers.has(socket.tournamentId)) {
+      liveScoreViewers.get(socket.tournamentId).delete(socket.id);
+      io.to(`tournament_${socket.tournamentId}`).emit('tournament_viewer_count', liveScoreViewers.get(socket.tournamentId).size);
+    }
+    console.log('User disconnected:', socket.id);
+  });
+});
+
+// Broadcast functions
+const broadcastScoreUpdate = (matchId, tournamentId, matchData) => {
+  io.to(`match_${matchId}`).emit('score_update', matchData);
+  if (tournamentId) {
+    io.to(`tournament_${tournamentId}`).emit('match_update', matchData);
+  }
+};
+
+const broadcastTournamentUpdate = (tournamentId, data) => {
+  io.to(`tournament_${tournamentId}`).emit('tournament_update', data);
+};
+
+// ==================== API ROUTES ====================
+
+app.get('/api/', (req, res) => {
+  res.json({ message: 'Cricket League Management System API', version: '2.0.0' });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// ==================== AUTH ROUTES ====================
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, name, role = 'spectator' } = req.body;
+
+    // Only allow admin, manager, spectator roles
+    const validRoles = ['admin', 'manager', 'spectator'];
+    const userRole = validRoles.includes(role) ? role : 'spectator';
+
+    const existing = await User.findOne({ email });
+    if (existing) {
+      return res.status(400).json({ detail: 'Email already registered' });
+    }
+
+    const user_id = `user_${uuidv4().slice(0, 12)}`;
+    const password_hash = await bcrypt.hash(password, 10);
+
+    const user = new User({
+      user_id,
+      email,
+      name,
+      password_hash,
+      role: userRole,
+      created_at: new Date()
+    });
+
+    await user.save();
+    const token = generateToken(user);
+
+    res.json({
+      access_token: token,
+      token_type: 'bearer',
+      user: { user_id, email, name, role: userRole, picture: null, team_id: null }
+    });
+  } catch (error) {
+    console.error('Register error:', error);
+    res.status(500).json({ detail: 'Registration failed' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ detail: 'Invalid credentials' });
+    }
+
+    const validPassword = await bcrypt.compare(password, user.password_hash || '');
+    if (!validPassword) {
+      return res.status(401).json({ detail: 'Invalid credentials' });
+    }
+
+    const token = generateToken(user);
+
+    res.json({
+      access_token: token,
+      token_type: 'bearer',
+      user: {
+        user_id: user.user_id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        picture: user.picture,
+        team_id: user.team_id
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ detail: 'Login failed' });
+  }
+});
+
+// Google OAuth Callback
+app.post('/api/auth/google/callback', async (req, res) => {
+  try {
+    const { id_token } = req.body;
+
+    // Decode JWT and extract user info
+    const decoded = JSON.parse(Buffer.from(id_token.split('.')[1], 'base64').toString());
+
+    const { email, name, picture } = decoded;
+
+    let user = await User.findOne({ email });
+
+    if (user) {
+      // Update profile if picture changed
+      if (picture && user.picture !== picture) {
+        user.picture = picture;
+        await user.save();
+      }
+    } else {
+      // Create new user from Google profile
+      const user_id = `user_${uuidv4().slice(0, 12)}`;
+      user = new User({
+        user_id,
+        email,
+        name,
+        picture,
+        role: 'spectator',
+        created_at: new Date()
+      });
+      await user.save();
+    }
+
+    const token = generateToken(user);
+
+    res.json({
+      access_token: token,
+      token_type: 'bearer',
+      user: {
+        user_id: user.user_id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        picture: user.picture,
+        team_id: user.team_id
+      }
+    });
+  } catch (error) {
+    console.error('Google OAuth error:', error);
+    res.status(401).json({ detail: 'Google OAuth failed' });
+  }
+});
+
+app.get('/api/auth/me', authenticate, (req, res) => {
+  res.json({
+    user_id: req.user.user_id,
+    email: req.user.email,
+    name: req.user.name,
+    role: req.user.role,
+    picture: req.user.picture,
+    team_id: req.user.team_id
+  });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  const session_token = req.cookies?.session_token;
+  if (session_token) {
+    await Session.deleteOne({ session_token });
+  }
+  res.clearCookie('session_token', { path: '/', sameSite: 'none', secure: true });
+  res.json({ message: 'Logged out successfully' });
+});
+
+// ==================== TEAMS ROUTES ====================
+
+app.get('/api/teams', async (req, res) => {
+  try {
+    const teams = await Team.find().select('-_id -__v');
+    res.json(teams);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch teams' });
+  }
+});
+
+app.get('/api/teams/:teamId', async (req, res) => {
+  try {
+    const team = await Team.findOne({ team_id: req.params.teamId }).select('-_id -__v');
+    if (!team) return res.status(404).json({ detail: 'Team not found' });
+    res.json(team);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch team' });
+  }
+});
+
+app.post('/api/teams', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const team_id = `team_${uuidv4().slice(0, 8)}`;
+    const team = new Team({
+      team_id,
+      ...req.body,
+      manager_id: req.user.user_id,
+      created_at: new Date()
+    });
+    await team.save();
+    res.json(team.toObject({ versionKey: false }));
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to create team' });
+  }
+});
+
+app.put('/api/teams/:teamId', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const team = await Team.findOne({ team_id: req.params.teamId });
+    if (!team) return res.status(404).json({ detail: 'Team not found' });
+
+    if (req.user.role === 'manager' && team.manager_id !== req.user.user_id) {
+      return res.status(403).json({ detail: 'Can only update your own team' });
+    }
+
+    const updated = await Team.findOneAndUpdate(
+      { team_id: req.params.teamId },
+      { $set: req.body },
+      { new: true }
+    ).select('-_id -__v');
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to update team' });
+  }
+});
+
+app.delete('/api/teams/:teamId', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const team = await Team.findOne({ team_id: req.params.teamId });
+    if (!team) return res.status(404).json({ detail: 'Team not found' });
+
+    if (req.user.role === 'manager' && team.manager_id !== req.user.user_id) {
+      return res.status(403).json({ detail: 'Can only delete your own team' });
+    }
+
+    await Team.deleteOne({ team_id: req.params.teamId });
+    await Player.deleteMany({ team_id: req.params.teamId });
+    res.json({ message: 'Team deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to delete team' });
+  }
+});
+
+app.get('/api/teams/:teamId/players', async (req, res) => {
+  try {
+    const players = await Player.find({ team_id: req.params.teamId }).select('-_id -__v');
+    res.json(players);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch players' });
+  }
+});
+
+// ==================== PLAYERS ROUTES ====================
+
+app.get('/api/players', async (req, res) => {
+  try {
+    const query = req.query.team_id ? { team_id: req.query.team_id } : {};
+    const players = await Player.find(query).select('-_id -__v');
+    res.json(players);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch players' });
+  }
+});
+
+app.get('/api/players/:playerId', async (req, res) => {
+  try {
+    const player = await Player.findOne({ player_id: req.params.playerId }).select('-_id -__v');
+    if (!player) return res.status(404).json({ detail: 'Player not found' });
+    res.json(player);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch player' });
+  }
+});
+
+app.post('/api/players', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const team = await Team.findOne({ team_id: req.body.team_id });
+    if (!team) return res.status(404).json({ detail: 'Team not found' });
+
+    if (req.user.role === 'manager' && team.manager_id !== req.user.user_id) {
+      return res.status(403).json({ detail: 'Can only add players to your own team' });
+    }
+
+    const player_id = `player_${uuidv4().slice(0, 8)}`;
+    const player = new Player({
+      player_id,
+      ...req.body,
+      created_at: new Date()
+    });
+    await player.save();
+    res.json(player.toObject({ versionKey: false }));
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to create player' });
+  }
+});
+
+app.put('/api/players/:playerId', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const player = await Player.findOne({ player_id: req.params.playerId });
+    if (!player) return res.status(404).json({ detail: 'Player not found' });
+
+    const team = await Team.findOne({ team_id: player.team_id });
+    if (req.user.role === 'manager' && team?.manager_id !== req.user.user_id) {
+      return res.status(403).json({ detail: 'Can only update players in your own team' });
+    }
+
+    const updated = await Player.findOneAndUpdate(
+      { player_id: req.params.playerId },
+      { $set: req.body },
+      { new: true }
+    ).select('-_id -__v');
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to update player' });
+  }
+});
+
+app.delete('/api/players/:playerId', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const player = await Player.findOne({ player_id: req.params.playerId });
+    if (!player) return res.status(404).json({ detail: 'Player not found' });
+
+    const team = await Team.findOne({ team_id: player.team_id });
+    if (req.user.role === 'manager' && team?.manager_id !== req.user.user_id) {
+      return res.status(403).json({ detail: 'Can only delete players from your own team' });
+    }
+
+    await Player.deleteOne({ player_id: req.params.playerId });
+    res.json({ message: 'Player deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to delete player' });
+  }
+});
+
+// ==================== TOURNAMENT ROUTES ====================
+
+// Get all tournaments
+app.get('/api/tournaments', async (req, res) => {
+  try {
+    const { status, sport_type } = req.query;
+    const query = {};
+    if (status) query.status = status;
+    if (sport_type) query.sport_type = sport_type;
+
+    const tournaments = await Tournament.find(query).sort({ created_at: -1 }).select('-_id -__v');
+    res.json(tournaments);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch tournaments' });
+  }
+});
+
+// Get tournament by ID
+app.get('/api/tournaments/:tournamentId', async (req, res) => {
+  try {
+    const tournament = await Tournament.findOne({ tournament_id: req.params.tournamentId }).select('-_id -__v');
+    if (!tournament) return res.status(404).json({ detail: 'Tournament not found' });
+
+    // Get all matches for this tournament
+    const matches = await TournamentMatch.find({ tournament_id: req.params.tournamentId })
+      .sort({ round: 1, match_number: 1 })
+      .select('-_id -__v');
+
+    // Get team details
+    const teamIds = tournament.teams || [];
+    const teams = await Team.find({ team_id: { $in: teamIds } }).select('-_id -__v');
+
+    res.json({
+      ...tournament.toObject(),
+      matches,
+      team_details: teams
+    });
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch tournament' });
+  }
+});
+
+// Create tournament (Manager only)
+app.post('/api/tournaments', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const { name, sport_type, format, teams, venue, overs, start_date, match_interval_hours } = req.body;
+
+    const tournament_id = `tourn_${uuidv4().slice(0, 8)}`;
+
+    const tournament = new Tournament({
+      tournament_id,
+      name,
+      sport_type: sport_type || 'cricket',
+      format: format || 'knockout',
+      teams: teams || [],
+      venue,
+      overs: overs || 20,
+      start_date: start_date ? new Date(start_date) : null,
+      match_interval_hours: match_interval_hours || 24,
+      created_by: req.user.user_id,
+      status: 'draft',
+      created_at: new Date()
+    });
+
+    await tournament.save();
+    res.json(tournament.toObject({ versionKey: false }));
+  } catch (error) {
+    console.error('Create tournament error:', error);
+    res.status(500).json({ detail: 'Failed to create tournament' });
+  }
+});
+
+// Update tournament
+app.put('/api/tournaments/:tournamentId', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const tournament = await Tournament.findOne({ tournament_id: req.params.tournamentId });
+    if (!tournament) return res.status(404).json({ detail: 'Tournament not found' });
+
+    if (req.user.role === 'manager' && tournament.created_by !== req.user.user_id) {
+      return res.status(403).json({ detail: 'Can only update your own tournaments' });
+    }
+
+    const updated = await Tournament.findOneAndUpdate(
+      { tournament_id: req.params.tournamentId },
+      { $set: req.body },
+      { new: true }
+    ).select('-_id -__v');
+
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to update tournament' });
+  }
+});
+
+// Add team to tournament
+app.post('/api/tournaments/:tournamentId/teams', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const { team_id } = req.body;
+    const tournament = await Tournament.findOne({ tournament_id: req.params.tournamentId });
+
+    if (!tournament) return res.status(404).json({ detail: 'Tournament not found' });
+    if (tournament.status !== 'draft') {
+      return res.status(400).json({ detail: 'Cannot add teams to started tournament' });
+    }
+
+    if (!tournament.teams.includes(team_id)) {
+      tournament.teams.push(team_id);
+      await tournament.save();
+    }
+
+    res.json(tournament.toObject({ versionKey: false }));
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to add team' });
+  }
+});
+
+// Remove team from tournament
+app.delete('/api/tournaments/:tournamentId/teams/:teamId', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const tournament = await Tournament.findOne({ tournament_id: req.params.tournamentId });
+
+    if (!tournament) return res.status(404).json({ detail: 'Tournament not found' });
+    if (tournament.status !== 'draft') {
+      return res.status(400).json({ detail: 'Cannot remove teams from started tournament' });
+    }
+
+    tournament.teams = tournament.teams.filter(t => t !== req.params.teamId);
+    await tournament.save();
+
+    res.json(tournament.toObject({ versionKey: false }));
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to remove team' });
+  }
+});
+
+// Generate bracket and start tournament
+app.post('/api/tournaments/:tournamentId/generate-bracket', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const tournament = await Tournament.findOne({ tournament_id: req.params.tournamentId });
+
+    if (!tournament) return res.status(404).json({ detail: 'Tournament not found' });
+    if (tournament.teams.length < 2) {
+      return res.status(400).json({ detail: 'Need at least 2 teams' });
+    }
+
+    const numTeams = tournament.teams.length;
+    const rounds = Math.ceil(Math.log2(numTeams));
+    const bracketSize = Math.pow(2, rounds);
+
+    // Shuffle teams
+    const shuffledTeams = [...tournament.teams].sort(() => Math.random() - 0.5);
+
+    // Pad with byes if needed
+    while (shuffledTeams.length < bracketSize) {
+      shuffledTeams.push(null);
+    }
+
+    // Create bracket structure
+    const bracket = {
+      rounds,
+      bracket_size: bracketSize,
+      teams: shuffledTeams
+    };
+
+    // Generate first round matches
+    const matches = [];
+    const startDate = tournament.start_date || new Date();
+    let matchDate = new Date(startDate);
+
+    for (let i = 0; i < bracketSize / 2; i++) {
+      const team1 = shuffledTeams[i * 2];
+      const team2 = shuffledTeams[i * 2 + 1];
+
+      const match_id = `match_${uuidv4().slice(0, 8)}`;
+      const match = {
+        match_id,
+        tournament_id: tournament.tournament_id,
+        round: 1,
+        match_number: i + 1,
+        team1_id: team1,
+        team2_id: team2,
+        venue: tournament.venue,
+        match_date: new Date(matchDate),
+        overs: tournament.overs,
+        match_type: tournament.overs === 20 ? 'T20' : tournament.overs === 50 ? 'ODI' : 'Custom',
+        status: team1 && team2 ? 'scheduled' : 'completed',
+        bracket_position: rounds === 1 ? 'F' : rounds === 2 ? `SF${i + 1}` : rounds === 3 ? `QF${i + 1}` : `R1M${i + 1}`,
+        created_at: new Date()
+      };
+
+      // If one team is bye, auto-advance
+      if (!team1 && team2) {
+        match.winner_id = team2;
+        match.result_summary = `${team2} advances (Bye)`;
+      } else if (team1 && !team2) {
+        match.winner_id = team1;
+        match.result_summary = `${team1} advances (Bye)`;
+      }
+
+      matches.push(match);
+      matchDate = new Date(matchDate.getTime() + tournament.match_interval_hours * 60 * 60 * 1000);
+    }
+
+    // Create placeholder matches for subsequent rounds
+    for (let round = 2; round <= rounds; round++) {
+      const matchesInRound = Math.pow(2, rounds - round);
+      for (let i = 0; i < matchesInRound; i++) {
+        const match_id = `match_${uuidv4().slice(0, 8)}`;
+        matches.push({
+          match_id,
+          tournament_id: tournament.tournament_id,
+          round,
+          match_number: i + 1,
+          team1_id: null,
+          team2_id: null,
+          venue: tournament.venue,
+          match_date: new Date(matchDate),
+          overs: tournament.overs,
+          match_type: tournament.overs === 20 ? 'T20' : 'ODI',
+          status: 'pending',
+          bracket_position: round === rounds ? 'F' : round === rounds - 1 ? `SF${i + 1}` : `R${round}M${i + 1}`,
+          created_at: new Date()
+        });
+        matchDate = new Date(matchDate.getTime() + tournament.match_interval_hours * 60 * 60 * 1000);
+      }
+    }
+
+    // Save matches
+    await TournamentMatch.insertMany(matches);
+
+    // Update tournament
+    tournament.bracket_data = bracket;
+    tournament.status = 'upcoming';
+    await tournament.save();
+
+    broadcastTournamentUpdate(tournament.tournament_id, { type: 'bracket_generated', tournament });
+
+    res.json({
+      message: 'Bracket generated successfully',
+      bracket,
+      matches_created: matches.length
+    });
+  } catch (error) {
+    console.error('Generate bracket error:', error);
+    res.status(500).json({ detail: 'Failed to generate bracket' });
+  }
+});
+
+// Get tournament matches
+app.get('/api/tournaments/:tournamentId/matches', async (req, res) => {
+  try {
+    const matches = await TournamentMatch.find({ tournament_id: req.params.tournamentId })
+      .sort({ round: 1, match_number: 1 })
+      .select('-_id -__v');
+    res.json(matches);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch matches' });
+  }
+});
+
+// ==================== TOURNAMENT MATCH ROUTES ====================
+
+// Get live matches (public)
+app.get('/api/matches/live', async (req, res) => {
+  try {
+    const matches = await TournamentMatch.find({ status: 'live' })
+      .sort({ scheduled_time: -1 })
+      .select('-_id -__v');
+    res.json(matches);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch live matches' });
+  }
+});
+
+// Get upcoming matches (public)
+app.get('/api/matches/upcoming', async (req, res) => {
+  try {
+    const matches = await TournamentMatch.find({
+      status: { $in: ['scheduled', 'pending'] }
+    })
+      .sort({ scheduled_time: 1 })
+      .limit(10)
+      .select('-_id -__v');
+    res.json(matches);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch upcoming matches' });
+  }
+});
+
+// Get all tournament matches (with optional tournament filter)
+app.get('/api/tournament-matches', async (req, res) => {
+  try {
+    const { tournamentId } = req.query;
+    const query = tournamentId ? { tournament_id: tournamentId } : {};
+
+    const matches = await TournamentMatch.find(query)
+      .sort({ scheduled_time: -1 })
+      .select('-_id -__v');
+    res.json({ matches });
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch tournament matches' });
+  }
+});
+
+// Get match details by ID
+app.get('/api/tournament-matches/:matchId', async (req, res) => {
+  try {
+    const match = await TournamentMatch.findOne({ match_id: req.params.matchId }).select('-_id -__v');
+    if (!match) return res.status(404).json({ detail: 'Match not found' });
+    res.json(match);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch match' });
+  }
+});
+
+// Start match
+app.post('/api/tournament-matches/:matchId/start', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const { toss_winner, toss_decision } = req.body;
+    const match = await TournamentMatch.findOne({ match_id: req.params.matchId });
+
+    if (!match) return res.status(404).json({ detail: 'Match not found' });
+    if (!['scheduled', 'pending'].includes(match.status)) {
+      return res.status(400).json({ detail: 'Match cannot be started' });
+    }
+
+    const batting_first = toss_decision === 'bat' ? toss_winner :
+      (toss_winner === match.team1_id ? match.team2_id : match.team1_id);
+
+    match.status = 'live';
+    match.toss_winner = toss_winner;
+    match.toss_decision = toss_decision;
+    match.innings1 = {
+      batting_team_id: batting_first,
+      runs: 0,
+      wickets: 0,
+      overs: 0,
+      extras: 0,
+      status: 'in_progress'
+    };
+
+    await match.save();
+
+    // Update tournament status
+    await Tournament.updateOne(
+      { tournament_id: match.tournament_id },
+      { $set: { status: 'live' } }
+    );
+
+    broadcastScoreUpdate(match.match_id, match.tournament_id, match.toObject());
+
+    res.json({ message: 'Match started', batting_first });
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to start match' });
+  }
+});
+
+// Update score
+app.put('/api/tournament-matches/:matchId/score', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const { innings, runs, wickets, overs, extras = 0 } = req.body;
+    const match = await TournamentMatch.findOne({ match_id: req.params.matchId });
+
+    if (!match) return res.status(404).json({ detail: 'Match not found' });
+    if (match.status !== 'live') {
+      return res.status(400).json({ detail: 'Match is not live' });
+    }
+
+    const inningsKey = innings === 1 ? 'innings1' : 'innings2';
+    match[inningsKey] = {
+      ...match[inningsKey],
+      runs,
+      wickets,
+      overs,
+      extras
+    };
+
+    await match.save();
+    broadcastScoreUpdate(match.match_id, match.tournament_id, match.toObject());
+
+    res.json(match.toObject({ versionKey: false }));
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to update score' });
+  }
+});
+
+// Switch innings
+app.post('/api/tournament-matches/:matchId/switch-innings', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const match = await TournamentMatch.findOne({ match_id: req.params.matchId });
+
+    if (!match || !match.innings1) {
+      return res.status(400).json({ detail: 'First innings not started' });
+    }
+
+    const batting_team = match.innings1.batting_team_id;
+    const next_batting = batting_team === match.team1_id ? match.team2_id : match.team1_id;
+
+    match.innings1.status = 'completed';
+    match.innings2 = {
+      batting_team_id: next_batting,
+      runs: 0,
+      wickets: 0,
+      overs: 0,
+      extras: 0,
+      status: 'in_progress'
+    };
+
+    await match.save();
+    broadcastScoreUpdate(match.match_id, match.tournament_id, match.toObject());
+
+    res.json({ message: 'Innings switched', batting_team: next_batting });
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to switch innings' });
+  }
+});
+
+// End match and advance winner
+app.post('/api/tournament-matches/:matchId/end', authenticate, requireManagerOrAdmin, async (req, res) => {
+  try {
+    const { winner_id, result_summary, man_of_match } = req.body;
+    const match = await TournamentMatch.findOne({ match_id: req.params.matchId });
+
+    if (!match) return res.status(404).json({ detail: 'Match not found' });
+
+    match.status = 'completed';
+    match.winner_id = winner_id || null;
+    match.result_summary = result_summary;
+    match.man_of_match = man_of_match || null;
+    if (match.innings1) match.innings1.status = 'completed';
+    if (match.innings2) match.innings2.status = 'completed';
+
+    await match.save();
+
+    // Update team stats
+    if (winner_id) {
+      const loser_id = winner_id === match.team1_id ? match.team2_id : match.team1_id;
+      await Team.updateOne({ team_id: winner_id }, { $inc: { matches_played: 1, matches_won: 1, points: 2 } });
+      await Team.updateOne({ team_id: loser_id }, { $inc: { matches_played: 1, matches_lost: 1 } });
+    }
+
+    // Advance winner to next round
+    const tournament = await Tournament.findOne({ tournament_id: match.tournament_id });
+    if (tournament && winner_id) {
+      const nextRound = match.round + 1;
+      const nextMatchNumber = Math.ceil(match.match_number / 2);
+
+      const nextMatch = await TournamentMatch.findOne({
+        tournament_id: match.tournament_id,
+        round: nextRound,
+        match_number: nextMatchNumber
+      });
+
+      if (nextMatch) {
+        // Determine slot (team1 or team2)
+        const isFirstSlot = match.match_number % 2 === 1;
+        if (isFirstSlot) {
+          nextMatch.team1_id = winner_id;
+        } else {
+          nextMatch.team2_id = winner_id;
+        }
+
+        // If both teams are set, mark as scheduled
+        if (nextMatch.team1_id && nextMatch.team2_id) {
+          nextMatch.status = 'scheduled';
+        }
+
+        await nextMatch.save();
+        broadcastScoreUpdate(nextMatch.match_id, match.tournament_id, nextMatch.toObject());
+      } else {
+        // This was the final match
+        tournament.winner_id = winner_id;
+        tournament.status = 'completed';
+        await tournament.save();
+      }
+    }
+
+    broadcastScoreUpdate(match.match_id, match.tournament_id, match.toObject());
+    broadcastTournamentUpdate(match.tournament_id, { type: 'match_completed', match });
+
+    res.json({ message: 'Match ended successfully' });
+  } catch (error) {
+    console.error('End match error:', error);
+    res.status(500).json({ detail: 'Failed to end match' });
+  }
+});
+
+// ==================== STATS ROUTES ====================
+
+app.get('/api/stats/standings', async (req, res) => {
+  try {
+    const teams = await Team.find().sort({ points: -1, net_run_rate: -1 }).select('-_id -__v');
+
+    const result = teams.map((team, idx) => ({
+      position: idx + 1,
+      team_id: team.team_id,
+      name: team.name,
+      short_name: team.short_name,
+      logo_url: team.logo_url,
+      matches_played: team.matches_played,
+      won: team.matches_won,
+      lost: team.matches_lost,
+      drawn: team.matches_drawn,
+      points: team.points,
+      nrr: team.net_run_rate
+    }));
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch standings' });
+  }
+});
+
+app.get('/api/stats/leaderboard/batting', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 10;
+    const players = await Player.find({ matches: { $gt: 0 } })
+      .sort({ runs: -1 })
+      .limit(limit)
+      .select('-_id -__v');
+
+    const result = players.map(p => ({
+      player_id: p.player_id,
+      name: p.name,
+      team_id: p.team_id,
+      matches: p.matches,
+      runs: p.runs,
+      average: p.matches > 0 ? (p.runs / p.matches).toFixed(2) : 0,
+      strike_rate: p.balls_faced > 0 ? ((p.runs / p.balls_faced) * 100).toFixed(2) : 0,
+      highest_score: p.highest_score,
+      fours: p.fours,
+      sixes: p.sixes,
+      fifties: p.fifties,
+      hundreds: p.hundreds
+    }));
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch batting leaderboard' });
+  }
+});
+
+app.get('/api/stats/leaderboard/bowling', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 10;
+    const players = await Player.find({ wickets: { $gt: 0 } })
+      .sort({ wickets: -1 })
+      .limit(limit)
+      .select('-_id -__v');
+
+    const result = players.map(p => {
+      const overs = p.balls_bowled > 0 ? p.balls_bowled / 6 : 0;
+      return {
+        player_id: p.player_id,
+        name: p.name,
+        team_id: p.team_id,
+        matches: p.matches,
+        wickets: p.wickets,
+        overs: overs.toFixed(1),
+        runs_conceded: p.runs_conceded,
+        average: p.wickets > 0 ? (p.runs_conceded / p.wickets).toFixed(2) : 0,
+        economy: overs > 0 ? (p.runs_conceded / overs).toFixed(2) : 0,
+        best_bowling: p.best_bowling
+      };
+    });
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch bowling leaderboard' });
+  }
+});
+
+// ==================== AI ROUTES ====================
+
+app.get('/api/ai/predict/:playerId', authenticate, async (req, res) => {
+  try {
+    if (!genAI) {
+      return res.status(400).json({ detail: 'AI service not configured. Please provide GEMINI_API_KEY.' });
+    }
+
+    const player = await Player.findOne({ player_id: req.params.playerId });
+    if (!player) return res.status(404).json({ detail: 'Player not found' });
+
+    const team = await Team.findOne({ team_id: player.team_id });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+    const prompt = `You are a cricket analyst AI. Based on the following player statistics, provide a brief performance prediction for their next match.
+
+Player: ${player.name}
+Team: ${team?.name || 'Unknown'}
+Role: ${player.role}
+Batting Style: ${player.batting_style}
+Bowling Style: ${player.bowling_style || 'N/A'}
+
+Career Statistics:
+- Matches: ${player.matches}
+- Runs: ${player.runs}
+- Strike Rate: ${player.balls_faced > 0 ? ((player.runs / player.balls_faced) * 100).toFixed(2) : 0}
+- Highest Score: ${player.highest_score}
+- Wickets: ${player.wickets}
+- Best Bowling: ${player.best_bowling}
+
+Provide a concise prediction (3-4 sentences) including expected runs range and wickets if applicable.`;
+
+    const result = await model.generateContent(prompt);
+
+    res.json({
+      prediction_id: `pred_${uuidv4().slice(0, 8)}`,
+      player_id: player.player_id,
+      player_name: player.name,
+      prediction_text: result.response.text(),
+      created_at: new Date()
+    });
+  } catch (error) {
+    console.error('AI prediction error:', error);
+    res.status(500).json({ detail: 'Failed to generate prediction' });
+  }
+});
+
+// ==================== ADMIN ROUTES ====================
+
+app.get('/api/admin/users', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const users = await User.find().select('-_id -__v -password_hash');
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch users' });
+  }
+});
+
+app.put('/api/admin/users/:userId/role', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { role, team_id } = req.query;
+    const validRoles = ['admin', 'manager', 'spectator'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ detail: 'Invalid role' });
+    }
+
+    const updateData = { role };
+    if (team_id) updateData.team_id = team_id;
+
+    const result = await User.updateOne({ user_id: req.params.userId }, { $set: updateData });
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ detail: 'User not found' });
+    }
+    res.json({ message: 'User role updated successfully' });
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to update role' });
+  }
+});
+
+app.delete('/api/admin/users/:userId', authenticate, requireAdmin, async (req, res) => {
+  try {
+    if (req.user.user_id === req.params.userId) {
+      return res.status(400).json({ detail: 'Cannot delete yourself' });
+    }
+
+    const result = await User.deleteOne({ user_id: req.params.userId });
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ detail: 'User not found' });
+    }
+
+    await Session.deleteMany({ user_id: req.params.userId });
+    res.json({ message: 'User deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to delete user' });
+  }
+});
+
+app.post('/api/admin/seed-data', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const existingTeams = await Team.countDocuments();
+    if (existingTeams > 0) {
+      return res.json({ message: 'Sample data already exists', teams: existingTeams });
+    }
+
+    const teamsData = [
+      { name: 'Mumbai Indians', short_name: 'MI', primary_color: '#004BA0', home_ground: 'Wankhede Stadium' },
+      { name: 'Chennai Super Kings', short_name: 'CSK', primary_color: '#F9CD05', home_ground: 'MA Chidambaram Stadium' },
+      { name: 'Royal Challengers', short_name: 'RCB', primary_color: '#EC1C24', home_ground: 'M. Chinnaswamy Stadium' },
+      { name: 'Kolkata Knight Riders', short_name: 'KKR', primary_color: '#3A225D', home_ground: 'Eden Gardens' },
+      { name: 'Delhi Capitals', short_name: 'DC', primary_color: '#0078BC', home_ground: 'Arun Jaitley Stadium' },
+      { name: 'Rajasthan Royals', short_name: 'RR', primary_color: '#EA1A85', home_ground: 'Sawai Mansingh Stadium' },
+      { name: 'Punjab Kings', short_name: 'PBKS', primary_color: '#ED1B24', home_ground: 'IS Bindra Stadium' },
+      { name: 'Sunrisers Hyderabad', short_name: 'SRH', primary_color: '#FF822A', home_ground: 'Rajiv Gandhi Stadium' },
+    ];
+
+    const createdTeams = [];
+    for (const team of teamsData) {
+      const team_id = `team_${uuidv4().slice(0, 8)}`;
+      const newTeam = await Team.create({
+        team_id,
+        ...team,
+        manager_id: req.user.user_id,
+        created_at: new Date()
+      });
+      createdTeams.push(newTeam);
+    }
+
+    // Create sample players
+    const playerNames = [
+      ['Rohit Sharma', 'Jasprit Bumrah', 'Hardik Pandya', 'Suryakumar Yadav', 'Ishan Kishan'],
+      ['MS Dhoni', 'Ravindra Jadeja', 'Deepak Chahar', 'Ruturaj Gaikwad', 'Moeen Ali'],
+      ['Virat Kohli', 'Glenn Maxwell', 'Mohammed Siraj', 'Faf du Plessis', 'Dinesh Karthik'],
+      ['Shreyas Iyer', 'Andre Russell', 'Sunil Narine', 'Venkatesh Iyer', 'Nitish Rana'],
+      ['Rishabh Pant', 'David Warner', 'Axar Patel', 'Prithvi Shaw', 'Anrich Nortje'],
+      ['Sanju Samson', 'Jos Buttler', 'Yuzvendra Chahal', 'Shimron Hetmyer', 'Trent Boult'],
+      ['Shikhar Dhawan', 'Liam Livingstone', 'Kagiso Rabada', 'Jonny Bairstow', 'Arshdeep Singh'],
+      ['Kane Williamson', 'Bhuvneshwar Kumar', 'Rahul Tripathi', 'Aiden Markram', 'Umran Malik']
+    ];
+
+    const roles = ['batsman', 'bowler', 'all-rounder', 'wicket-keeper', 'batsman'];
+
+    for (let i = 0; i < createdTeams.length; i++) {
+      for (let j = 0; j < playerNames[i].length; j++) {
+        const player_id = `player_${uuidv4().slice(0, 8)}`;
+        await Player.create({
+          player_id,
+          name: playerNames[i][j],
+          email: `${playerNames[i][j].toLowerCase().replace(' ', '.')}@team.com`,
+          team_id: createdTeams[i].team_id,
+          jersey_number: (j + 1) * 7,
+          role: roles[j % 5],
+          batting_style: j % 2 === 0 ? 'right-hand' : 'left-hand',
+          bowling_style: roles[j % 5] !== 'batsman' ? 'right-arm fast' : null,
+          matches: 15 + j * 2,
+          runs: 300 + j * 80,
+          balls_faced: 250 + j * 40,
+          fours: 25 + j * 5,
+          sixes: 12 + j * 3,
+          highest_score: 85 + j * 10,
+          fifties: 3 + j,
+          hundreds: j === 0 ? 1 : 0,
+          wickets: roles[j % 5] !== 'batsman' ? 8 + j * 2 : 0,
+          balls_bowled: roles[j % 5] !== 'batsman' ? 150 + j * 20 : 0,
+          runs_conceded: roles[j % 5] !== 'batsman' ? 120 + j * 15 : 0,
+          best_bowling: roles[j % 5] !== 'batsman' ? `${3 + j}/25` : '0/0',
+          catches: 6 + j,
+          created_at: new Date()
+        });
+      }
+    }
+
+    res.json({
+      message: 'Sample data seeded successfully',
+      teams_created: createdTeams.length,
+      players_created: createdTeams.length * 5
+    });
+  } catch (error) {
+    console.error('Seed error:', error);
+    res.status(500).json({ detail: 'Failed to seed data' });
+  }
+});
+
+// ==================== CHAT ROUTES ====================
+
+app.get('/api/chat/:matchId', async (req, res) => {
+  try {
+    const messages = await ChatMessage.find({ match_id: req.params.matchId })
+      .sort({ created_at: -1 })
+      .limit(100)
+      .select('-_id -__v');
+    res.json(messages.reverse());
+  } catch (error) {
+    res.status(500).json({ detail: 'Failed to fetch chat messages' });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 8001;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on port ${PORT}`);
+});
